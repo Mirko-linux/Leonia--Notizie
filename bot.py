@@ -7,6 +7,7 @@ from newspaper import Article
 from datetime import datetime
 import nltk
 import os
+import re
 
 
 # === DOWNLOAD NLTK DATA ===
@@ -25,15 +26,18 @@ RSS_FEEDS = [
     'https://www.repubblica.it/rss/homepage/rss2.0.xml',
     'https://www.ilpost.it/feed/'
 ]
+
 # Configura logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Database per link persistenti
+# Database per link persistenti e digest pubblicati
 def init_db():
     conn = sqlite3.connect('news_bot.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS posted_links
                  (link TEXT PRIMARY KEY, published_at TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS posted_digests
+                 (digest_time TIMESTAMP PRIMARY KEY)''')
     conn.commit()
     conn.close()
 
@@ -48,15 +52,33 @@ def is_link_posted(link):
 def mark_link_posted(link):
     conn = sqlite3.connect('news_bot.db')
     c = conn.cursor()
-    c.execute("INSERT INTO posted_links (link, published_at) VALUES (?, ?)", 
+    c.execute("INSERT OR IGNORE INTO posted_links (link, published_at) VALUES (?, ?)", 
               (link, datetime.now()))
     conn.commit()
     conn.close()
 
-# === FUNZIONE PER ESTRARRE IMMAGINE E TESTO ===
+def is_digest_sent_this_hour():
+    """Controlla se è già stato inviato un digest in quest'ora"""
+    conn = sqlite3.connect('news_bot.db')
+    c = conn.cursor()
+    current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
+    c.execute("SELECT 1 FROM posted_digests WHERE digest_time = ?", (current_hour,))
+    result = c.fetchone()
+    conn.close()
+    return result is not None
+
+def mark_digest_sent():
+    """Segna che il digest di quest'ora è stato inviato"""
+    conn = sqlite3.connect('news_bot.db')
+    c = conn.cursor()
+    current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
+    c.execute("INSERT OR IGNORE INTO posted_digests (digest_time) VALUES (?)", (current_hour,))
+    conn.commit()
+    conn.close()
+
+# === FUNZIONE PER ESTRARRE DATI ===
 def estrai_dati(link):
     try:
-        # Configura Article per essere più robusto
         config = {
             'request_timeout': 10,
             'follow_meta_refresh': True,
@@ -67,7 +89,6 @@ def estrai_dati(link):
         articolo.download()
         articolo.parse()
         
-        # Usa NLP solo se disponibile, altrimenti usa testo normale
         try:
             articolo.nlp()
             summary = articolo.summary
@@ -79,73 +100,133 @@ def estrai_dati(link):
         logging.error(f"Errore nell'estrazione da {link}: {e}")
         return None, None, None, None
 
-# === ANALISI SEMPLICE ===
-def analizza_articolo(titolo, testo, entry):
+# === ANALISI E RIASSUNTO BREVE ===
+def crea_riassunto_breve(titolo, testo, entry):
+    """Crea un riassunto breve per il digest"""
     try:
-        # Prova prima con il testo estratto, poi con il summary del feed
         if testo and len(testo) > 50:
             frasi = testo.split('. ')
-            intro = '. '.join(frasi[:2]) if len(frasi) >= 2 else testo[:300] + "..."
-            return f"📰 {titolo}\n\n{intro.strip()}"
+            intro = frasi[0] if frasi else testo[:150]
+            return intro.strip()
         elif entry.get('summary'):
-            # Usa il summary dal feed RSS
-            summary = entry.summary
-            # Rimuovi tag HTML
-            import re
-            summary = re.sub('<[^<]+?>', '', summary)
-            return f"📰 {titolo}\n\n{summary[:300]}..."
+            summary = re.sub('<[^<]+?>', '', entry.summary)
+            return summary[:150].strip()
         else:
-            return f"📰 {titolo}\n\nLeggi l'articolo completo per i dettagli."
+            return "Dettagli nell'articolo completo."
     except Exception as e:
-        logging.error(f"Errore nell'analisi: {e}")
-        return f"📰 {titolo}"
+        logging.error(f"Errore nel riassunto: {e}")
+        return "Leggi l'articolo per i dettagli."
 
-# === PUBBLICAZIONE SU TELEGRAM ===
-def pubblica_su_telegram(titolo, link, immagine, analisi):
+# === FILTRA NOTIZIE SIMILI ===
+def sono_simili(titolo1, titolo2):
+    """Controlla se due titoli sono troppo simili (stesso argomento)"""
+    # Normalizza i titoli
+    t1 = titolo1.lower().strip()
+    t2 = titolo2.lower().strip()
+    
+    # Se sono identici
+    if t1 == t2:
+        return True
+    
+    # Estrai parole chiave (rimuovi parole comuni)
+    stop_words = {'il', 'lo', 'la', 'i', 'gli', 'le', 'un', 'una', 'di', 'da', 'in', 'per', 'con', 'su', 'a', 'è', 'e', 'che', 'del', 'della', 'dei'}
+    parole1 = set([p for p in t1.split() if len(p) > 3 and p not in stop_words])
+    parole2 = set([p for p in t2.split() if len(p) > 3 and p not in stop_words])
+    
+    # Se più del 60% delle parole sono in comune
+    if len(parole1) > 0 and len(parole2) > 0:
+        comuni = len(parole1.intersection(parole2))
+        percentuale = comuni / min(len(parole1), len(parole2))
+        return percentuale > 0.6
+    
+    return False
+
+def filtra_notizie_duplicate(notizie):
+    """Rimuove notizie duplicate o troppo simili"""
+    notizie_filtrate = []
+    
+    for notizia in notizie:
+        duplicata = False
+        for n_filtrata in notizie_filtrate:
+            if sono_simili(notizia['titolo'], n_filtrata['titolo']):
+                duplicata = True
+                break
+        
+        if not duplicata:
+            notizie_filtrate.append(notizia)
+    
+    return notizie_filtrate
+
+# === RACCOLTA NOTIZIE DELL'ORA ===
+def raccogli_notizie_nuove():
+    """Raccoglie fino a 5 notizie nuove da tutti i feed"""
+    notizie = []
+    
+    for url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            logging.info(f"Controllando feed: {url} - {len(feed.entries)} articoli")
+            
+            for entry in feed.entries[:10]:  # Controlla i primi 10
+                link = entry.link
+                
+                if not is_link_posted(link) and len(notizie) < 10:  # Raccogliamo più notizie per poi filtrare
+                    immagine, titolo, riassunto, testo = estrai_dati(link)
+                    
+                    if not titolo and hasattr(entry, 'title'):
+                        titolo = entry.title
+                    
+                    if titolo:
+                        riassunto_breve = crea_riassunto_breve(titolo, testo or riassunto, entry)
+                        notizie.append({
+                            'titolo': titolo,
+                            'link': link,
+                            'riassunto': riassunto_breve,
+                            'immagine': immagine
+                        })
+                        mark_link_posted(link)  # Segna subito come letto
+                    
+        except Exception as e:
+            logging.error(f"Errore nel processare feed {url}: {e}")
+    
+    # Filtra duplicati
+    notizie = filtra_notizie_duplicate(notizie)
+    
+    # Limita a 5 notizie
+    return notizie[:5]
+
+# === CREA E INVIA DIGEST ===
+def crea_e_invia_digest(notizie):
+    """Crea un singolo post con tutte le notizie"""
+    if not notizie:
+        logging.info("Nessuna notizia nuova per il digest")
+        return False
+    
+    # Intestazione con ora
+    ora_attuale = datetime.now().strftime("%H:%M")
+    messaggio = f"📰 <b>NOTIZIARIO - Ore {ora_attuale}</b>\n\n"
+    
+    # Aggiungi ogni notizia
+    for i, notizia in enumerate(notizie, 1):
+        messaggio += f"<b>{i}. {notizia['titolo']}</b>\n"
+        messaggio += f"{notizia['riassunto']}\n"
+        messaggio += f"🔗 {notizia['link']}\n\n"
+    
+    # Invia a Telegram
     try:
-        messaggio = f"{analisi}\n\n🔗 {link}"
-        
-        # Pulisci il messaggio per Telegram
-        messaggio = messaggio.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        
-        if immagine and immagine.startswith('http'):
-            try:
-                # Prova a inviare con immagine
-                img_response = requests.get(immagine, timeout=10)
-                if img_response.status_code == 200:
-                    response = requests.post(
-                        f'https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto',
-                        data={
-                            'chat_id': CHAT_ID,
-                            'caption': messaggio[:1024],
-                            'parse_mode': 'HTML'
-                        },
-                        files={'photo': img_response.content}
-                    )
-                else:
-                    raise Exception("Immagine non disponibile")
-            except:
-                # Fallback a messaggio senza immagine
-                response = requests.post(
-                    f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
-                    json={
-                        'chat_id': CHAT_ID,
-                        'text': messaggio,
-                        'parse_mode': 'HTML'
-                    }
-                )
-        else:
-            response = requests.post(
-                f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
-                json={
-                    'chat_id': CHAT_ID,
-                    'text': messaggio,
-                    'parse_mode': 'HTML'
-                }
-            )
+        response = requests.post(
+            f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+            json={
+                'chat_id': CHAT_ID,
+                'text': messaggio,
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': True
+            }
+        )
         
         if response.status_code == 200:
-            logging.info(f"Articolo pubblicato: {titolo}")
+            logging.info(f"Digest pubblicato con {len(notizie)} notizie")
+            mark_digest_sent()
             return True
         else:
             logging.error(f"Errore Telegram: {response.text}")
@@ -155,37 +236,53 @@ def pubblica_su_telegram(titolo, link, immagine, analisi):
         logging.error(f"Errore nell'invio a Telegram: {e}")
         return False
 
+# === VERIFICA ORARIO ===
+def is_orario_attivo():
+    """Verifica se siamo nell'orario di pubblicazione (6:00 - 21:00)"""
+    ora_corrente = datetime.now().hour
+    return 6 <= ora_corrente < 21
+
 # === CICLO PRINCIPALE ===
-def fetch_and_send():
-    for url in RSS_FEEDS:
+def main_loop():
+    while True:
         try:
-            feed = feedparser.parse(url)
-            logging.info(f"Controllando feed: {url} - {len(feed.entries)} articoli")
+            ora_attuale = datetime.now()
             
-            for entry in feed.entries[:5]:  # Solo ultimi 5 articoli
-                link = entry.link
-                
-                if not is_link_posted(link):
-                    logging.info(f"Nuovo articolo trovato: {link}")
-                    
-                    immagine, titolo, riassunto, testo = estrai_dati(link)
-                    
-                    # Se l'estrazione fallisce, usa i dati dal feed
-                    if not titolo and hasattr(entry, 'title'):
-                        titolo = entry.title
-                    
-                    if titolo:
-                        analisi = analizza_articolo(titolo, testo or riassunto, entry)
-                        if pubblica_su_telegram(titolo, link, immagine, analisi):
-                            mark_link_posted(link)
-                            time.sleep(3)  # Pausa tra messaggi per evitare rate limit
-                    
+            # Verifica se siamo nell'orario attivo
+            if not is_orario_attivo():
+                logging.info("Fuori dall'orario di pubblicazione (6:00-21:00). In attesa...")
+                time.sleep(300)  # Controlla ogni 5 minuti di notte
+                continue
+            
+            # Verifica se abbiamo già pubblicato in quest'ora
+            if is_digest_sent_this_hour():
+                minuti_alla_prossima_ora = 60 - ora_attuale.minute
+                logging.info(f"Digest già inviato per quest'ora. Prossimo tra {minuti_alla_prossima_ora} minuti...")
+                time.sleep(300)  # Controlla ogni 5 minuti
+                continue
+            
+            # È una nuova ora, raccogliamo e inviamo le notizie
+            logging.info("Raccogliendo notizie per il digest orario...")
+            notizie = raccogli_notizie_nuove()
+            
+            if notizie:
+                crea_e_invia_digest(notizie)
+            else:
+                logging.info("Nessuna notizia nuova trovata")
+                mark_digest_sent()  # Segna comunque per evitare tentativi ripetuti
+            
+            # Attendi prima del prossimo controllo
+            time.sleep(300)  # Controlla ogni 5 minuti
+            
+        except KeyboardInterrupt:
+            logging.info("Bot fermato dall'utente")
+            break
         except Exception as e:
-            logging.error(f"Errore nel processare feed {url}: {e}")
+            logging.error(f"Errore nel loop principale: {e}")
+            time.sleep(300)
 
 # === AVVIO ===
 if __name__ == "__main__":
-    # Scarica tutti i dati NLTK necessari
     try:
         nltk.download('punkt', quiet=True)
         nltk.download('punkt_tab', quiet=True)
@@ -194,15 +291,7 @@ if __name__ == "__main__":
         logging.warning(f"Alcuni download NLTK falliti: {e}")
     
     init_db()
-    logging.info("Bot avviato...")
+    logging.info("Bot notiziario avviato...")
+    logging.info("Pubblicherà digest orari dalle 6:00 alle 21:00")
     
-    while True:
-        try:
-            fetch_and_send()
-            time.sleep(60)  # Controlla ogni minuto
-        except KeyboardInterrupt:
-            logging.info("Bot fermato dall'utente")
-            break
-        except Exception as e:
-            logging.error(f"Errore nel loop principale: {e}")
-            time.sleep(60)
+    main_loop()
