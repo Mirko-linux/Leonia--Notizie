@@ -1,1 +1,90 @@
+name: Leonia+ Notizie
 
+on:
+  schedule:
+    # Esegui ogni ora dalle 6:00 alle 21:00 (UTC, quindi 5:00-20:00 UTC per ora italiana)
+    - cron: '0 5-20 * * *'  # Ogni ora dalle 5:00 alle 20:00 UTC (6:00-21:00 ora italiana)
+  workflow_dispatch:     # Permette avvio manuale dal pannello GitHub
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install feedparser requests newspaper3k nltk
+          pip install lxml[html_clean]  # Fix per newspaper3k
+      
+      - name: Cache and restore database
+        uses: actions/cache@v3
+        with:
+          path: news_bot.db
+          key: news-bot-db-${{ github.run_id }}
+          restore-keys: |
+            news-bot-db-
+      
+      - name: Run the bot (single execution)
+        run: |
+          python -c "
+          import sys
+          import os
+          sys.path.insert(0, '.')
+          
+          # Importa le funzioni dal bot
+          from bot import init_db, is_digest_sent_this_hour, is_orario_attivo, raccogli_notizie_nuove, crea_e_invia_digest
+          import logging
+          
+          logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+          
+          # Inizializza database
+          init_db()
+          
+          # Verifica orario
+          if not is_orario_attivo():
+              logging.info('Fuori dall orario di pubblicazione (6:00-21:00)')
+              sys.exit(0)
+          
+          # Verifica se già pubblicato
+          if is_digest_sent_this_hour():
+              logging.info('Digest già pubblicato per questa ora')
+              sys.exit(0)
+          
+          # Raccogli e pubblica
+          logging.info('Raccogliendo notizie...')
+          notizie = raccogli_notizie_nuove()
+          
+          if notizie:
+              crea_e_invia_digest(notizie)
+              logging.info(f'Digest pubblicato con {len(notizie)} notizie')
+          else:
+              logging.info('Nessuna notizia nuova trovata')
+          "
+      
+      - name: Upload database artifact
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: news-bot-database
+          path: news_bot.db
+          retention-days: 7
