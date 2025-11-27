@@ -3,3 +3,4 @@ requests
 newspaper3k
 nltk
 lxml[html_clean]
+google-genai
