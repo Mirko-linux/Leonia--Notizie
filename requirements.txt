@@ -2,3 +2,4 @@ google-genai
 requests
 feedparser
 newspaper3k
+boto3
