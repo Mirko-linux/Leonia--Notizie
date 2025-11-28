@@ -1,32 +1,27 @@
-import feedparser
 import requests
-import time
-import sqlite3
+import feedparser
 import logging
-from newspaper import Article
-from datetime import datetime, date
-import nltk
 import os
 import re
+import json
+from newspaper import Article
+from datetime import datetime, date
 
-# === NUOVI IMPORT E CONFIGURAZIONE GEMINI (Modern Python SDK) ===
+# === IMPORT ESSENZIALI PER SERVERLESS (SOSTITUIRE NLTK) ===
+# Rimosso: import sqlite3
+# Rimosso: import time
+# Rimosso: import nltk (la sua funzione di riassunto è ora affidata a Gemini)
+
 from google import genai
 from google.genai.errors import APIError
 
 # Configura logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# === DOWNLOAD NLTK DATA ===
-try:
-    nltk.download('punkt', quiet=True)
-    nltk.download('punkt_tab', quiet=True)
-    nltk.download('averaged_perceptron_tagger', quiet=True)
-except Exception as e:
-    logging.warning(f"Alcuni download NLTK falliti: {e}")
-
 # === VARIABILI D'AMBIENTE ===
+# Queste saranno lette da AWS Lambda Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID", "@Lumenariaplusgiornale2")
+CHAT_ID = os.environ.get("CHAT_ID") 
 
 RSS_FEEDS = [
     'https://www.ansa.it/sito/ansait_rss.xml',
@@ -40,84 +35,90 @@ MODEL_FLASH = 'gemini-2.5-flash'
 MODEL_PRO = 'gemini-2.5-pro'
 
 try:
-    # Il client legge automaticamente GEMINI_API_KEY
+    # Il client cerca automaticamente GEMINI_API_KEY nell'ambiente
     client = genai.Client() 
-    logging.info(f"Client Gemini caricato. Modelli disponibili: {MODEL_FLASH} e {MODEL_PRO}")
+    logging.info(f"Client Gemini caricato. Modelli: {MODEL_FLASH} e {MODEL_PRO}")
 except Exception as e:
-    logging.error(f"ERRORE: Impossibile caricare il client Gemini. Variabile GEMINI_API_KEY mancante o errata: {e}")
+    logging.error(f"ERRORE: Impossibile caricare il client Gemini. Controlla GEMINI_API_KEY: {e}")
     client = None
 
 
-# === GESTIONE DATABASE ===
+# =========================================================
+# === INTERFACCIA DATABASE (DEVI IMPLEMENTARE QUI LA TUA LOGICA CLOUD) ===
+# =========================================================
+# QUESTE FUNZIONI VANNO SOSTITUITE con l'interazione REALE con DynamoDB (AWS) o Cosmos DB (Azure)
+# La logica mock usa una variabile globale in memoria (che NON È PERSISTENTE tra le chiamate Lambda!)
+# Devi implementare la persistenza per il deploy finale.
 
-def init_db():
-    conn = sqlite3.connect('news_bot.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS posted_links
-                 (link TEXT PRIMARY KEY, published_at TIMESTAMP)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS posted_digests
-                 (digest_time TIMESTAMP PRIMARY KEY)''')
-    # NUOVA TABELLA: Traccia il digest Pro giornaliero
-    c.execute('''CREATE TABLE IF NOT EXISTS posted_pro_digest
-                 (digest_date DATE PRIMARY KEY)''')
-    conn.commit()
-    conn.close()
+# Struttura dati (solo per mantenere la firma delle funzioni)
+# Sarà una tabella nel tuo DB esterno.
+
+def get_db_state_mock():
+    # In Lambda, se non usi un DB esterno, lo stato viene perso.
+    # In una vera implementazione AWS, qui inizializzeresti la connessione DynamoDB.
+    logging.warning("ATTENZIONE: Stai usando le funzioni Mock DB, lo stato non sarà persistente.")
+    return {} # In un contesto reale, questo non verrebbe mai usato così.
+
 
 def is_link_posted(link):
-    conn = sqlite3.connect('news_bot.db')
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM posted_links WHERE link = ?", (link,))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
+    """VERA IMPLEMENTAZIONE: Interroga DynamoDB/CosmosDB se 'link' esiste in 'posted_links'."""
+    # Esempio di logica:
+    # try:
+    #     response = dynamodb.get_item(Key={'Link': link})
+    #     return 'Item' in response
+    # except Exception:
+    #     return False
+    return False # Usa True solo per debug locale
 
 def mark_link_posted(link):
-    conn = sqlite3.connect('news_bot.db')
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO posted_links (link, published_at) VALUES (?, ?)", 
-              (link, datetime.now()))
-    conn.commit()
-    conn.close()
+    """VERA IMPLEMENTAZIONE: Inserisce 'link' in 'posted_links' su DynamoDB/CosmosDB."""
+    # Esempio di logica:
+    # dynamodb.put_item(Item={'Link': link, 'PublishedAt': str(datetime.now())})
+    logging.info(f"Mock: Segnato link come postato: {link[:50]}...")
+    pass
 
 def is_digest_sent_this_hour():
-    """Controlla se è già stato inviato un digest in quest'ora"""
-    conn = sqlite3.connect('news_bot.db')
-    c = conn.cursor()
-    current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
-    c.execute("SELECT 1 FROM posted_digests WHERE digest_time = ?", (current_hour,))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
+    """VERA IMPLEMENTAZIONE: Controlla se l'ora corrente (YYYY-MM-DD-HH) è in 'posted_digests'."""
+    current_hour_str = datetime.now().strftime("%Y-%m-%d-%H")
+    # try:
+    #     response = dynamodb.get_item(Key={'Hour': current_hour_str})
+    #     return 'Item' in response
+    # except Exception:
+    #     return False
+    return False
 
 def mark_digest_sent():
-    """Segna che il digest di quest'ora è stato inviato"""
-    conn = sqlite3.connect('news_bot.db')
-    c = conn.cursor()
-    current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
-    c.execute("INSERT OR IGNORE INTO posted_digests (digest_time) VALUES (?)", (current_hour,))
-    conn.commit()
-    conn.close()
+    """VERA IMPLEMENTAZIONE: Inserisce l'ora corrente in 'posted_digests'."""
+    current_hour_str = datetime.now().strftime("%Y-%m-%d-%H")
+    # dynamodb.put_item(Item={'Hour': current_hour_str})
+    logging.info(f"Mock: Segnato digest FLASH per l'ora: {current_hour_str}")
+    pass
     
 def is_pro_digest_sent_today():
-    conn = sqlite3.connect('news_bot.db')
-    c = conn.cursor()
-    today = date.today().isoformat()
-    c.execute("SELECT 1 FROM posted_pro_digest WHERE digest_date = ?", (today,))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
+    """VERA IMPLEMENTAZIONE: Controlla se la data corrente (YYYY-MM-DD) è in 'posted_pro_digest'."""
+    today_str = date.today().isoformat()
+    # try:
+    #     response = dynamodb.get_item(Key={'Date': today_str})
+    #     return 'Item' in response
+    # except Exception:
+    #     return False
+    return False
 
 def mark_pro_digest_sent():
-    conn = sqlite3.connect('news_bot.db')
-    c = conn.cursor()
-    today = date.today().isoformat()
-    c.execute("INSERT OR IGNORE INTO posted_pro_digest (digest_date) VALUES (?)", (today,))
-    conn.commit()
-    conn.close()
+    """VERA IMPLEMENTAZIONE: Inserisce la data corrente in 'posted_pro_digest'."""
+    today_str = date.today().isoformat()
+    # dynamodb.put_item(Item={'Date': today_str})
+    logging.info(f"Mock: Segnato approfondimento PRO per la data: {today_str}")
+    pass
 
-# === FUNZIONE PER ESTRARRE DATI (invariata) ===
+# =========================================================
+# === FINE INTERFACCIA DATABASE ===
+# =========================================================
 
+
+# === FUNZIONE PER ESTRARRE DATI (Ottimizzata) ===
 def estrai_dati(link):
+    """Estrae l'articolo completo e il titolo dal link."""
     try:
         config = {
             'request_timeout': 10,
@@ -129,20 +130,17 @@ def estrai_dati(link):
         articolo.download()
         articolo.parse()
         
-        try:
-            articolo.nlp()
-            summary = articolo.summary
-        except:
-            summary = articolo.text[:500] + "..." if len(articolo.text) > 500 else articolo.text
-            
-        return articolo.top_image, articolo.title, summary, articolo.text
+        # Rimuove l'uso di articolo.nlp() per eliminare la dipendenza NLTK non necessaria
+        testo_completo = articolo.text 
+        
+        return articolo.top_image, articolo.title, testo_completo
     except Exception as e:
         logging.error(f"Errore nell'estrazione da {link}: {e}")
-        return None, None, None, None
+        return None, None, None
 
 # === ESTRAI CONTENUTO BASE (invariata) ===
 def estrai_contenuto_base(entry):
-    """Estrae contenuto base dal feed entry"""
+    """Estrae contenuto base (titolo e summary) dal feed entry in caso di fallimento di Article."""
     titolo = entry.title if hasattr(entry, 'title') else "Notizia senza titolo"
     
     contenuto = ""
@@ -151,18 +149,14 @@ def estrai_contenuto_base(entry):
     elif hasattr(entry, 'description'):
         contenuto = re.sub('<[^<]+?>', '', entry.description)
     
-    return titolo, contenuto[:300]
+    return titolo, contenuto[:500]
 
 
-# === FUNZIONI DI FILTRAGGIO (ripristinate dal tuo codice iniziale) ===
-
+# === FUNZIONI DI FILTRAGGIO (invariate) ===
 def sono_simili(titolo1, titolo2):
-    """Controlla se due titoli sono troppo simili (stesso argomento)"""
     t1 = titolo1.lower().strip()
     t2 = titolo2.lower().strip()
-    
     if t1 == t2: return True
-    
     stop_words = {'il', 'lo', 'la', 'i', 'gli', 'le', 'un', 'una', 'di', 'da', 'in', 'per', 'con', 'su', 'a', 'è', 'e', 'che', 'del', 'della', 'dei'}
     parole1 = set([p for p in t1.split() if len(p) > 3 and p not in stop_words])
     parole2 = set([p for p in t2.split() if len(p) > 3 and p not in stop_words])
@@ -171,11 +165,9 @@ def sono_simili(titolo1, titolo2):
         comuni = len(parole1.intersection(parole2))
         percentuale = comuni / min(len(parole1), len(parole2))
         return percentuale > 0.6
-    
     return False
 
 def filtra_notizie_duplicate(notizie):
-    """Rimuove notizie duplicate o troppo simili"""
     notizie_filtrate = []
     for notizia in notizie:
         duplicata = False
@@ -189,7 +181,6 @@ def filtra_notizie_duplicate(notizie):
 
 
 # === ANALISI CON GEMINI FLASH (Digest Orario) ===
-
 def analizza_con_gemini_flash(notizie):
     """Usa Gemini FLASH per analizzare e organizzare le notizie orarie."""
     if not notizie or not client: return None
@@ -199,8 +190,8 @@ def analizza_con_gemini_flash(notizie):
         for i, notizia in enumerate(notizie, 1):
             testo_notizie += f"\n--- NOTIZIA {i} ---\n"
             testo_notizie += f"Titolo: {notizia['titolo']}\n"
-            # Limita l'input a Flash a 400 caratteri per velocità
-            testo_notizie += f"Contenuto: {notizia['contenuto'][:400]}\n"
+            # Invia il contenuto estratto, limitandolo per la velocità di FLASH
+            testo_notizie += f"Contenuto: {notizia['contenuto'][:1000]}\n" 
             testo_notizie += f"Link: {notizia['link']}\n"
         
         prompt = f"""Sei un giornalista professionista che cura un notiziario orario in italiano.
@@ -214,7 +205,7 @@ Analizza queste notizie e:
 NOTIZIE DA ANALIZZARE:
 {testo_notizie}
 
-Rispondi SOLO con questo formato (niente altro testo):
+Rispondi SOLO con questo formato. Non includere introduzioni, saluti o testo aggiuntivo:
 
 NOTIZIA 1
 Titolo: [titolo originale]
@@ -236,35 +227,34 @@ Link: [link originale]
         return None
 
 # === ANALISI CON GEMINI PRO (Approfondimento Quotidiano) ===
-
 def analizza_con_gemini_pro(notizie):
     """Usa Gemini PRO per l'analisi approfondita giornaliera."""
     if not notizie or not client: return None
     
     try:
+        # Prepara l'input per PRO (più ampio)
         testo_notizie = ""
         for i, notizia in enumerate(notizie, 1):
             testo_notizie += f"### NOTIZIA {i}: {notizia['titolo']}\n"
-            # Invia più testo a Pro (max 8000 caratteri per articolo)
-            testo_notizie += f"{notizia['contenuto'][:8000]}\n\n"
+            testo_notizie += f"{notizia['contenuto'][:8000]}\n\n" # Limite alto per Pro
 
         prompt_pro = f"""Sei un analista di alto livello. Il tuo compito è fornire un "Approfondimento Quotidiano" in italiano.
         
-        Analizza il seguente set di articoli e fai quanto segue:
-        1.  **Identifica i 2-3 temi principali** del giorno tra le notizie fornite.
-        2.  **Scrivi un riassunto analitico** e coeso di circa 4-5 paragrafi che colleghi i vari articoli, ne spieghi il contesto e ne valuti l'impatto potenziale.
-        3.  **Suggerisci tre domande chiave** (Key Takeaways) che i lettori dovrebbero porsi per comprendere l'importanza degli eventi.
+Analizza il seguente set di articoli e fai quanto segue:
+1. **Identifica i 2-3 temi principali** del giorno tra le notizie fornite.
+2. **Scrivi un riassunto analitico** e coeso di circa 4-5 paragrafi che colleghi i vari articoli, ne spieghi il contesto e ne valuti l'impatto potenziale.
+3. **Suggerisci tre domande chiave** (Key Takeaways) che i lettori dovrebbero porsi.
         
-        Formato richiesto:
-        * Titolo: 🧠 APPROFONDIMENTO: [Tema principale identificato]
-        * Corpo: [L'analisi coesa in 4-5 paragrafi, usando tag HTML come <b>, <i>, <br>]
-        * Takeaways: [Le tre domande chiave come lista]
+Formato richiesto (rispondi in formato HTML per Telegram):
+* Titolo: 🧠 <b>APPROFONDIMENTO: [Tema principale identificato]</b>
+* Corpo: [L'analisi coesa in 4-5 paragrafi, usando tag HTML come <b>, <i>, <br>]
+* Takeaways: [Le tre domande chiave come lista con <ul>/<li>]
         
-        TESTI DA ANALIZZARE:
-        ---
-        {testo_notizie}
-        ---
-        """
+TESTI DA ANALIZZARE:
+---
+{testo_notizie}
+---
+"""
         logging.info("Invio richiesta a Gemini PRO per approfondimento...")
         response = client.models.generate_content(
             model=MODEL_PRO,
@@ -278,13 +268,11 @@ def analizza_con_gemini_pro(notizie):
         return None
 
 # === PARSING RISPOSTA GEMINI (invariata) ===
-
 def parse_risposta_gemini(risposta_gemini):
     """Estrae le notizie dalla risposta di Gemini (usato per il digest FLASH)"""
     notizie_organizzate = []
     
     try:
-        # Questo parsing si aspetta l'output formattato dalla richiesta FLASH
         blocchi = re.split(r'NOTIZIA \d+', risposta_gemini)
         
         for blocco in blocchi[1:]:
@@ -316,15 +304,19 @@ def raccogli_notizie(max_per_feed=15, mark_posted=True):
             for entry in feed.entries[:max_per_feed]: 
                 link = entry.link
                 
+                # Usa la funzione database esterna
                 if not is_link_posted(link):
-                    immagine, titolo, riassunto_nlp, testo_completo = estrai_dati(link)
+                    immagine, titolo, testo_completo = estrai_dati(link)
                     
                     if not titolo and hasattr(entry, 'title'):
                         titolo = entry.title
                     
-                    contenuto_finale = testo_completo or riassunto_nlp or estrai_contenuto_base(entry)[1]
+                    # Contenuto base di fallback se l'estrazione completa fallisce
+                    _, contenuto_base = estrai_contenuto_base(entry) 
+                    
+                    contenuto_finale = testo_completo or contenuto_base
 
-                    if titolo and contenuto_finale:
+                    if titolo and contenuto_finale and len(contenuto_finale) > 100: # Filtra contenuti troppo brevi
                         notizie.append({
                             'titolo': titolo,
                             'link': link,
@@ -332,7 +324,7 @@ def raccogli_notizie(max_per_feed=15, mark_posted=True):
                             'immagine': immagine
                         })
                         if mark_posted:
-                            mark_link_posted(link)
+                            mark_link_posted(link) # Usa la funzione database esterna
     
         except Exception as e:
             logging.error(f"Errore nel processare feed {url}: {e}")
@@ -368,7 +360,7 @@ def crea_e_invia_digest_flash(notizie_analizzate):
         )
         if response.status_code == 200:
             logging.info(f"Digest FLASH pubblicato con {len(notizie_analizzate)} notizie")
-            mark_digest_sent()
+            mark_digest_sent() # Usa la funzione database esterna
             return True
         else:
             logging.error(f"Errore Telegram FLASH: {response.text}")
@@ -381,12 +373,13 @@ def crea_e_invia_digest_flash(notizie_analizzate):
 def crea_e_invia_approfondimento_pro():
     """Raccoglie dati e invia l'approfondimento PRO."""
     logging.info("Preparazione dati per approfondimento PRO...")
-    # Raccoglie i 5-10 articoli più recenti senza segnarli come "posted" di nuovo
-    notizie_per_pro = raccogli_notizie(max_per_feed=3, mark_posted=False)[:10] 
+    
+    # Raccoglie gli ultimi 15 articoli recenti (senza segnarli come "posted" di nuovo)
+    notizie_per_pro = raccogli_notizie(max_per_feed=5, mark_posted=False)[:15] 
     
     if not notizie_per_pro:
         logging.info("Nessuna notizia recente per l'approfondimento Pro.")
-        mark_pro_digest_sent() # Segna per non riprovare subito
+        mark_pro_digest_sent() 
         return False
 
     risposta_pro = analizza_con_gemini_pro(notizie_per_pro)
@@ -413,7 +406,7 @@ def crea_e_invia_approfondimento_pro():
         
         if response_tg.status_code == 200:
             logging.info("Approfondimento Pro pubblicato con successo.")
-            mark_pro_digest_sent()
+            mark_pro_digest_sent() # Usa la funzione database esterna
             return True
         else:
             logging.error(f"Errore Telegram Approfondimento Pro: {response_tg.text}")
@@ -429,67 +422,62 @@ def is_orario_attivo():
     ora_corrente = datetime.now().hour
     return 6 <= ora_corrente < 21
 
-# === CICLO PRINCIPALE ===
 
-def main_loop():
-    while True:
-        try:
-            ora_attuale = datetime.now()
-            
-            # 1. LOGICA APPROFONDIMENTO PRO (alle 18:00)
-            if ora_attuale.hour == 18 and not is_pro_digest_sent_today():
-                logging.info("È l'ora dell'Approfondimento Pro (18:00).")
-                crea_e_invia_approfondimento_pro()
-                time.sleep(300) 
-                continue
+# =========================================================
+# === PUNTO DI INGRESSO (Entry Point) PER AWS LAMBDA ===
+# =========================================================
 
-            # 2. LOGICA DIGEST ORARIO FLASH
-            if not is_orario_attivo():
-                logging.info("Fuori dall'orario di pubblicazione (6:00-21:00). In attesa...")
-                time.sleep(300) 
-                continue
-            
-            if is_digest_sent_this_hour():
-                minuti_alla_prossima_ora = 60 - ora_attuale.minute
-                logging.info(f"Digest già inviato per quest'ora. Prossimo tra {minuti_alla_prossima_ora} minuti...")
-                time.sleep(300) 
-                continue
-            
-            # Esegui il digest FLASH orario
-            logging.info("Raccogliendo notizie per il digest orario (FLASH)...")
-            notizie = raccogli_notizie(mark_posted=True)
-            
-            if notizie:
-                logging.info(f"Raccolte {len(notizie)} notizie, invio a Gemini FLASH per analisi...")
-                risposta_gemini = analizza_con_gemini_flash(notizie)
-                
-                if risposta_gemini:
-                    notizie_organizzate = parse_risposta_gemini(risposta_gemini)
-                    if notizie_organizzate:
-                        crea_e_invia_digest_flash(notizie_organizzate)
-                    else:
-                        logging.error("Parsing risposta Gemini FLASH fallito")
-                        mark_digest_sent()
-                else:
-                    logging.error("Gemini FLASH non ha risposto, salto questo digest")
-                    mark_digest_sent()
-            else:
-                logging.info("Nessuna notizia nuova trovata")
-                mark_digest_sent()
-            
-            time.sleep(300) 
-            
-        except KeyboardInterrupt:
-            logging.info("Bot fermato dall'utente")
-            break
-        except Exception as e:
-            logging.error(f"Errore nel loop principale: {e}")
-            time.sleep(300)
-
-# === AVVIO ===
-if __name__ == "__main__":
-    init_db()
-    logging.info("Bot notiziario avviato con Gemini AI...")
-    logging.info("Pubblicherà digest orari (FLASH) dalle 6:00 alle 21:00 e Approfondimento (PRO) alle 18:00.")
+def lambda_handler(event, context):
+    """
+    Funzione principale chiamata da Amazon EventBridge (Scheduler).
+    È il punto di ingresso per l'esecuzione serverless.
+    """
     
-    main_loop()
+    ora_attuale = datetime.now()
+    logging.info(f"Esecuzione bot avviata all'ora: {ora_attuale.hour}:00")
+
+    # 1. LOGICA APPROFONDIMENTO PRO (alle 18:00)
+    # Esegui solo all'ora 18 e solo se non è stato ancora inviato oggi.
+    if ora_attuale.hour == 18:
+        if not is_pro_digest_sent_today():
+            logging.info("Tentativo di Approfondimento Pro (18:00).")
+            crea_e_invia_approfondimento_pro()
+        else:
+            logging.info("Approfondimento Pro già inviato oggi.")
+
+    # 2. LOGICA DIGEST ORARIO FLASH (6:00 - 21:00)
+    # Esegui solo se siamo nell'orario attivo e non è stato inviato in quest'ora.
+    elif is_orario_attivo() and not is_digest_sent_this_hour():
+        logging.info("Tentativo di digest orario (FLASH)...")
+        
+        notizie = raccogli_notizie(mark_posted=True)
+        
+        if notizie:
+            logging.info(f"Raccolte {len(notizie)} notizie, invio a Gemini FLASH per analisi...")
+            risposta_gemini = analizza_con_gemini_flash(notizie)
+            
+            if risposta_gemini:
+                notizie_organizzate = parse_risposta_gemini(risposta_gemini)
+                if notizie_organizzate:
+                    crea_e_invia_digest_flash(notizie_organizzate)
+                else:
+                    logging.error("Parsing risposta Gemini FLASH fallito")
+                    mark_digest_sent() # Segna comunque l'ora per evitare re-run
+            else:
+                logging.error("Gemini FLASH non ha risposto, salto questo digest")
+                mark_digest_sent()
+        else:
+            logging.info("Nessuna notizia nuova trovata")
+            mark_digest_sent()
+    
+    elif is_digest_sent_this_hour():
+        logging.info("Digest FLASH già inviato per quest'ora. Non faccio nulla.")
+
+    else:
+        logging.info("Fuori dall'orario di pubblicazione (6:00-21:00). Non faccio nulla.")
+
+    # Il risultato di Lambda
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Bot logic executed successfully.')
+    }
