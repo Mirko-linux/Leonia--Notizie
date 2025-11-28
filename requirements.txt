@@ -1,6 +1,4 @@
-feedparser
-requests
-newspaper3k
-nltk
-lxml[html_clean]
 google-genai
+requests
+feedparser
+newspaper3k
